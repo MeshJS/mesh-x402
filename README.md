@@ -1,28 +1,28 @@
 # @meshsdk/x402
 
-Cardano [`exact`](https://github.com/x402-foundation/x402/blob/main/specs/schemes/exact/scheme_exact_cardano.md) scheme for [x402](https://github.com/x402-foundation/x402) v2. A server answers `402`, the client signs, a facilitator submits, the content unlocks.
+Charge for an API or a page with Cardano. The server answers `402 Payment Required`, the client signs a transaction, a facilitator submits it, and the content is released.
 
-Docs: [meshjs.dev/apis/x402](https://meshjs.dev/apis/x402)
+This package implements the Cardano [`exact`](https://github.com/x402-foundation/x402/blob/main/specs/schemes/exact/scheme_exact_cardano.md) scheme of [x402](https://github.com/x402-foundation/x402) v2. Full walkthrough: [meshjs.dev/apis/x402](https://meshjs.dev/apis/x402).
 
 ```bash
 npm install @meshsdk/x402
 ```
 
-The client never broadcasts. Price is `PAYMENT-REQUIRED`, the signed tx is `PAYMENT-SIGNATURE`, the result is `PAYMENT-RESPONSE`.
+The client never broadcasts. The price travels in `PAYMENT-REQUIRED`, the signed transaction in `PAYMENT-SIGNATURE`, and the outcome in `PAYMENT-RESPONSE`. You can charge in ada or a CNT.
 
 ## Payment methods
 
-Pick one per offer with `extra.assetTransferMethod`. Asset is `lovelace` or `policyId.assetNameHex`.
+Each offer picks one method with `extra.assetTransferMethod`.
 
-| Method | Lock destination | After `/settle` |
-| --- | --- | --- |
-| `default` | `payTo` address | Funds are already yours |
-| `script` | Your Plutus script | You spend the script yourself |
-| `masumi` | Masumi `vested_pay` escrow | Later spends: result, refund, dispute |
+**`default`** pays a wallet address. Once the facilitator settles, the funds are already yours.
+
+**`script`** locks the payment at a Plutus script you choose (custom), with an optional datum. x402 checks that the lock went to that script with the datum you declared. Unlocking the script is your contract’s job.
+
+**`masumi`** locks the payment in the Masumi `vested_pay` escrow, under terms the seller signed. Settlement only locks the funds. The seller is paid later, after a result, a refund, or a dispute.
 
 ## Facilitator
 
-Checks the signed tx, submits it once, waits for confirmations. No wallet, no funds.
+The facilitator checks a signed transaction, submits it once, and waits for confirmations. It holds no keys and needs no funds — only a Cardano provider.
 
 ```ts
 import { BlockfrostProvider } from "@meshsdk/provider";
@@ -47,30 +47,26 @@ serveMeshHttp(
 );
 ```
 
-`POST /verify` and `POST /settle` take `{ paymentPayload, paymentRequirements }`. `paymentRequirements` must be the server's own offer, not the client's copy (`REQUIREMENTS_MISMATCH` otherwise).
+`POST /verify` and `POST /settle` both take `{ paymentPayload, paymentRequirements }`. Pass the server’s own record of the offer, not the copy inside the client’s payload. If they differ, the facilitator returns `REQUIREMENTS_MISMATCH`.
 
-`/settle` claims the tx id, broadcasts once, then: `confirmed`, `settlement_pending` (retry the same payload), `duplicate_settlement`, or `EXPIRED`.
+`/settle` claims the transaction id and broadcasts it once. After that you get `confirmed`, `settlement_pending` (retry the same payload; it will not submit again), `duplicate_settlement`, or `EXPIRED`.
 
 ## Server
 
-Issue an offer, remember it, release content when the facilitator confirms.
+The resource server states a price, remembers what it offered, and serves the content once the facilitator confirms payment. `createPaywall` does all three.
 
 ```ts
 import {
   buildDefaultOffer,
-  buildMasumiOffer,
-  buildScriptOffer,
   createFacilitatorClient,
   createMeshHttpApp,
   createPaywall,
   serveMeshHttp,
 } from "@meshsdk/x402";
 
-const facilitator = createFacilitatorClient("http://localhost:8787");
-
 const paywall = createPaywall({
   network: "cardano:preprod",
-  facilitator,
+  facilitator: createFacilitatorClient("http://localhost:8787"),
   issue: () =>
     buildDefaultOffer({
       network: "cardano:preprod",
@@ -85,6 +81,8 @@ app.get("/paid", (c) => paywall(c.req.raw));
 serveMeshHttp(app, { port: 3000 });
 ```
 
+Build the offer for the method you want:
+
 ```ts
 buildDefaultOffer({ network, amount, payTo });
 
@@ -92,7 +90,7 @@ buildScriptOffer({
   network,
   amount,
   script: { type: "plutusV3", code: "<hex>" },
-  datum: "d8799fff", // optional inline CBOR; x402 checks it is attached, not that it is correct
+  datum: "d8799fff", // optional inline CBOR
 });
 
 const { requirements } = await buildMasumiOffer({
@@ -105,6 +103,8 @@ const { requirements } = await buildMasumiOffer({
 ```
 
 ## Client
+
+`fetchWithPayment` works like `fetch`. If the server answers `402`, it builds and signs a payment, retries, and returns the content.
 
 ```ts
 import { MeshWallet } from "@meshsdk/wallet";
@@ -127,42 +127,55 @@ const { response, paymentResponse } = await fetchWithPayment(
 );
 ```
 
-If `/settle` returns `settlement_pending`, resend the same `PAYMENT-SIGNATURE`. Never build a second payment.
+If settlement is still pending, send the same `PAYMENT-SIGNATURE` again. Do not build a second payment.
 
 ## Withdrawal
 
-| Method | How funds leave |
-| --- | --- |
-| `default` | No second tx. They already sit at `payTo`. |
-| `script` | Your contract's spend (redeemer, validity, payouts). Pass an `evaluator`. |
-| `masumi` | Lock only. Spend the escrow with the builders below. |
+How the money leaves depends on the method.
 
-Masumi clock: `payByTime` → `submitResultTime` → `unlockTime` → `externalDisputeUnlockTime`.
+With **`default`**, there is nothing more to do. The payment already sits at `payTo`.
 
-Happy path: lock → seller `buildSubmitResultTx` before `submitResultTime` → wait until `unlockTime` → seller `buildWithdrawTx`.
+With **`script`**, you spend your own contract: redeemer, validity window, and payouts. Pass an `evaluator` so execution units are estimated.
+
+With **`masumi`**, `/settle` only locks. Funds leave in later transactions against the escrow. The offer sets a clock: the buyer must lock by `payByTime`, the seller must record a result by `submitResultTime`, the seller can withdraw after `unlockTime`, and admins can settle a dispute after `externalDisputeUnlockTime`.
+
+The usual path is lock, then `buildSubmitResultTx` before `submitResultTime`, then `buildWithdrawTx` after `unlockTime`.
 
 ```ts
-import { buildSubmitResultTx, buildWithdrawTx, parseMasumiLockDatum } from "@meshsdk/x402";
+import {
+  buildSubmitResultTx,
+  buildWithdrawTx,
+  parseMasumiLockDatum,
+} from "@meshsdk/x402";
 
 const datum = parseMasumiLockDatum(escrowUtxo.output.plutusData)!;
 const ctx = { fetcher: provider, evaluator: provider, currentSlot };
 
-const submit = await buildSubmitResultTx(escrowUtxo, datum, resultHashHex, sellerWallet, deployment, ctx);
+const submit = await buildSubmitResultTx(
+  escrowUtxo,
+  datum,
+  resultHashHex,
+  sellerWallet,
+  deployment,
+  ctx,
+);
 await provider.submitTx(await sellerWallet.signTx(submit));
 
-const withdraw = await buildWithdrawTx(nextUtxo, nextDatum, sellerWallet, deployment, ctx);
+const withdraw = await buildWithdrawTx(
+  nextUtxo,
+  nextDatum,
+  sellerWallet,
+  deployment,
+  ctx,
+);
 await provider.submitTx(await sellerWallet.signTx(withdraw));
 ```
 
-| Builder | Who | Action |
-| --- | --- | --- |
-| `buildSubmitResultTx` | seller | Record the result |
-| `buildWithdrawTx` | seller | Take funds (`unlockTime`, or after buyer authorize) |
-| `buildAuthorizeRefundTx` | seller | Forfeit so the buyer can refund |
-| `buildSetRefundRequestedTx` | buyer | Request refund (dispute if a result exists) |
-| `buildAuthorizeWithdrawalTx` | buyer | In a dispute, let the seller withdraw now |
-| `buildWithdrawRefundTx` | buyer | Take the refund |
-| `buildWithdrawDisputedTx` | anyone | Admin CIP-8 quorum (`signAdminIntent`, `verifyAdminSignature`) |
+The other escrow actions:
+
+- Seller records a result with `buildSubmitResultTx`, withdraws with `buildWithdrawTx`, or gives up the claim with `buildAuthorizeRefundTx`.
+- Buyer requests a refund with `buildSetRefundRequestedTx` (this becomes a dispute if a result already exists), lets the seller withdraw immediately with `buildAuthorizeWithdrawalTx`, or takes a refund with `buildWithdrawRefundTx`.
+- Anyone can settle a dispute after `externalDisputeUnlockTime` with `buildWithdrawDisputedTx`, using an admin CIP-8 quorum (`signAdminIntent`, `verifyAdminSignature`).
 
 Masumi `vested_pay` support is derived from [x402-foundation/x402](https://github.com/x402-foundation/x402) (Apache-2.0).
 
